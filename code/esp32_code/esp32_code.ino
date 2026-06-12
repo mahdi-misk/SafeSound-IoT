@@ -1,14 +1,14 @@
 #include "driver/i2s.h"
-#include <WiFi.h>
 #include <ESPmDNS.h>
 #include <WebSocketsClient.h>
+#include <WiFi.h>
 
 // ======================= Settings =======================
 String websocket_server_host = "";
 const uint16_t websocket_server_port = 8000;
 
-const char* ssid = "SafeSound_AP";
-const char* password = "password123";
+const char *ssid = "TinyRL";
+const char *password = "12345678";
 WebSocketsClient webSocket;
 
 // ======================= Pins =======================
@@ -230,7 +230,7 @@ void setup() {
 
   Serial.println("Starting WiFi Access Point...");
   WiFi.softAP(ssid, password);
-  
+
   Serial.println("\nAccess Point Started!");
   Serial.print("ESP32 AP IP Address: ");
   Serial.println(WiFi.softAPIP());
