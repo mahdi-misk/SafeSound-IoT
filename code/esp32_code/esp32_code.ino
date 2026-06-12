@@ -1,12 +1,14 @@
 #include "driver/i2s.h"
-#include <EasyWiFiMDNS.h>
+#include <WiFi.h>
+#include <ESPmDNS.h>
 #include <WebSocketsClient.h>
 
 // ======================= Settings =======================
 String websocket_server_host = "";
 const uint16_t websocket_server_port = 8000;
 
-EasyWiFiMDNS wifi;
+const char* ssid = "SafeSound_AP";
+const char* password = "password123";
 WebSocketsClient webSocket;
 
 // ======================= Pins =======================
@@ -194,7 +196,6 @@ void webSocketEvent(WStype_t type, uint8_t *payload, size_t length) {
 // ======================= Network Task Core 0 =======================
 void networkTask(void *pvParameters) {
   for (;;) {
-    wifi.loop();
     webSocket.loop();
 
     if (buffer_ready) {
@@ -227,19 +228,15 @@ void setup() {
 
   setupI2S();
 
-  wifi.setApPassword("12345678");
-  wifi.setPortalTimeout(180);
-  wifi.setConnectTimeout(20);
-  wifi.setDebug(true);
+  Serial.println("Starting WiFi Access Point...");
+  WiFi.softAP(ssid, password);
+  
+  Serial.println("\nAccess Point Started!");
+  Serial.print("ESP32 AP IP Address: ");
+  Serial.println(WiFi.softAPIP());
 
-  Serial.println("Connecting to WiFi via EasyWiFiMDNS...");
-
-  if (wifi.begin("device_1")) {
-    Serial.println("\nWiFi Connected!");
-    Serial.print("IP Address: ");
-    Serial.println(wifi.ip());
-  } else {
-    Serial.println("\nWiFi Connection failed or portal timed out!");
+  if (!MDNS.begin("device_1")) {
+    Serial.println("Error setting up MDNS responder!");
   }
 
   Serial.println("Searching for AI server ai-server.local...");
@@ -248,7 +245,7 @@ void setup() {
 
   if (websocket_server_host == "" || websocket_server_host == "0.0.0.0") {
     Serial.println("Server not found! Using fallback IP...");
-    websocket_server_host = "192.168.43.67";
+    websocket_server_host = "192.168.4.2";
   } else {
     Serial.print("Server found! IP: ");
     Serial.println(websocket_server_host);
