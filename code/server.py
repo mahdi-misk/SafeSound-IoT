@@ -20,6 +20,27 @@ warnings.filterwarnings('ignore')
 # Set ffmpeg path explicitly for pydub
 AudioSegment.converter = r"C:\Users\mahdi\AppData\Local\Microsoft\WinGet\Links\ffmpeg.exe"
 
+def clear_saved_audio():
+    paths_to_clear = [
+        os.path.join(os.path.dirname(__file__), 'saved_audio'),
+        os.path.join(os.path.dirname(__file__), '..', 'saved_audio')
+    ]
+    for path in paths_to_clear:
+        abs_path = os.path.abspath(path)
+        if os.path.exists(abs_path):
+            try:
+                for filename in os.listdir(abs_path):
+                    file_path = os.path.join(abs_path, filename)
+                    if os.path.isfile(file_path) or os.path.islink(file_path):
+                        os.unlink(file_path)
+                    elif os.path.isdir(file_path):
+                        shutil.rmtree(file_path)
+                print(f"Cleared old audio files from: {abs_path}")
+            except Exception as e:
+                print(f"Failed to clear {abs_path}. Reason: {e}")
+
+# clear_saved_audio()  # Disabled: keep old audio files for debugging
+
 app = FastAPI()
 
 # ==================== AI Model Initialization ====================
@@ -49,7 +70,7 @@ try:
             ai_model_type = 'h5'
             print("Keras H5 Model loaded successfully!")
         except ImportError:
-            print("⚠️ TensorFlow is not installed. Cannot load H5 model.")
+            print("TensorFlow is not installed. Cannot load H5 model.")
 
     # Fallback to PKL if neither ONNX nor H5 loaded successfully
     if ai_model_type is None and os.path.exists(PKL_MODEL_PATH):
@@ -60,17 +81,19 @@ try:
             ai_scaler = model_data['scaler']
         ai_model_type = 'pkl'
         print("Fallback RF Model loaded successfully!")
-    else:
+    elif ai_model_type is None:
         print("No AI Model found in workspace.")
 except Exception as e:
     print(f"Error loading AI Model: {e}")
     traceback.print_exc()
 
-def extract_features(audio_path):
-    """Extract 16 audio features from the file for RF model"""
+def extract_features(y, sr=16000):
+    """Extract 16 audio features from array for RF model"""
     try:
-        y, sr = librosa.load(audio_path, sr=16000, duration=3)
-        
+        max_samples = int(5.0 * sr)
+        if len(y) > max_samples:
+            y = y[:max_samples]
+            
         features = []
         
         # 1-13: MFCCs
@@ -95,12 +118,13 @@ def extract_features(audio_path):
         print(f"Error extracting features: {e}")
         return None
 
-def extract_mel_spectrogram(file_path):
-    """Extract Mel-Spectrogram features for the CNN ONNX model"""
+def extract_mel_spectrogram(y, sr=16000):
+    """Extract Mel-Spectrogram features from array"""
     try:
-        # Load audio at 16kHz for max 2.0s duration
-        y, sr = librosa.load(file_path, sr=16000, duration=2.0)
-        
+        max_samples = int(2.0 * sr)
+        if len(y) > max_samples:
+            y = y[:max_samples]
+            
         # Extract Mel-spectrogram and convert to decibels
         mel_spec = librosa.feature.melspectrogram(y=y, sr=sr, n_mels=128)
         mel_spec_db = librosa.power_to_db(mel_spec, ref=np.max)
@@ -118,10 +142,13 @@ def extract_mel_spectrogram(file_path):
         print(f"Error extracting Mel-spectrogram: {e}")
         return None
 
-def extract_mfcc_40(file_path):
-    """Extract 40 MFCC features for 1D CNN"""
+def extract_mfcc_40(y, sr=16000):
+    """Extract 40 MFCC features from array"""
     try:
-        y, sr = librosa.load(file_path, sr=16000, duration=3.0)
+        max_samples = int(3.0 * sr)
+        if len(y) > max_samples:
+            y = y[:max_samples]
+            
         mfccs = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=40)
         mfccs_scaled = np.mean(mfccs.T, axis=0)
         return mfccs_scaled
@@ -130,55 +157,88 @@ def extract_mfcc_40(file_path):
         return None
 # =================================================================
 
+
+import collections
+import time
+
 # Create templates directory if it doesn't exist
 TEMPLATES_DIR = os.path.join(os.path.dirname(__file__), "templates")
 os.makedirs(TEMPLATES_DIR, exist_ok=True)
 templates = Jinja2Templates(directory=TEMPLATES_DIR)
 
+# ==================== Live Monitoring Settings ====================
+SAMPLE_RATE = 16000
+BYTES_PER_SAMPLE = 2
+WINDOW_SECONDS = 10
+HOP_SECONDS = 1
+
+WINDOW_BYTES = SAMPLE_RATE * BYTES_PER_SAMPLE * WINDOW_SECONDS
+HOP_BYTES = SAMPLE_RATE * BYTES_PER_SAMPLE * HOP_SECONDS
+SAVE_DEBUG_WAV = False
+
 # Global state
-connected_esp32: WebSocket = None
-connected_device_name = "ESP32"
+connected_esp32 = None
+connected_device_name = "device_1"
 is_recording = False
-audio_buffer = bytearray()
-sample_rate = 8000 # Matches ESP32 sampling rate
-ai_status_message = ""
+rolling_buffer = bytearray()
+bytes_since_last_inference = 0
+inference_running = False
+ai_status_message = "Waiting to start..."
+
+# Status tracking
+recent_predictions = collections.deque(maxlen=5)
+recent_devices = collections.deque(maxlen=7)
+current_smoothed_state = 0
+current_raw_state = 0
+current_confidence = 0.0
+last_inference_latency_ms = 0
+total_received_seconds = 0.0
+
+app = FastAPI()
 
 @app.get("/", response_class=HTMLResponse)
 async def get(request: Request):
     return templates.TemplateResponse("index.html", {"request": request, "is_recording": is_recording})
 
 def run_inference_sync(chunk: bytearray, sr: int):
-    import time
     global connected_device_name
     
-    # Save audio permanently to PC
-    os.makedirs("saved_audio", exist_ok=True)
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    device_safe = "".join([c if c.isalnum() else "_" for c in connected_device_name])
-    saved_wav_path = os.path.join("saved_audio", f"{device_safe}_audio_{timestamp}.wav")
+    start_time = time.time()
     
-    result = {"status": "error", "prediction": None, "device": "Unknown"}
+    if SAVE_DEBUG_WAV:
+        os.makedirs("saved_audio", exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        device_safe = "".join([c if c.isalnum() else "_" for c in connected_device_name])
+        saved_wav_path = os.path.join("saved_audio", f"{device_safe}_audio_{timestamp}.wav")
+        try:
+            with wave.open(saved_wav_path, 'wb') as wf:
+                wf.setnchannels(1)
+                wf.setsampwidth(2)
+                wf.setframerate(sr)
+                wf.writeframes(chunk)
+            print(f"Audio chunk saved to PC at: {saved_wav_path}")
+        except Exception as e:
+            print(f"Error saving wav: {e}")
+            
+    result = {"status": "error", "prediction": None, "device": "Unknown", "confidence": 0.0, "latency_ms": 0}
     try:
-        with wave.open(saved_wav_path, 'wb') as wf:
-            wf.setnchannels(1)
-            wf.setsampwidth(1)
-            wf.setframerate(sr)
-            wf.writeframes(chunk)
-            
-        print(f"✅ Audio chunk saved to PC at: {saved_wav_path}")
-            
         if ai_model_type == 'onnx' and onnx_session is not None:
+            audio_data = np.frombuffer(chunk, dtype=np.int16)
+            audio_float = audio_data.astype(np.float32) / 32768.0
+            y_16k = librosa.resample(y=audio_float, orig_sr=sr, target_sr=16000)
+            target_sr = 16000
+
             input_name = onnx_session.get_inputs()[0].name
             input_shape = onnx_session.get_inputs()[0].shape
             
             raw_output = None
             if len(input_shape) >= 3 and input_shape[1] == 40:
-                features = extract_mfcc_40(saved_wav_path)
+                features = extract_mfcc_40(y_16k, target_sr)
                 if features is not None:
                     input_data = features.reshape(1, 40, 1).astype(np.float32)
                     raw_output = onnx_session.run(None, {input_name: input_data})[0]
             else:
-                mel_features = extract_mel_spectrogram(saved_wav_path)
+                mel_features = extract_mel_spectrogram(y_16k, target_sr)
                 if mel_features is not None:
                     input_data = mel_features.reshape(1, 128, 128, 1).astype(np.float32)
                     raw_output = onnx_session.run(None, {input_name: input_data})[0]
@@ -188,6 +248,7 @@ def run_inference_sync(chunk: bytearray, sr: int):
                 if num_classes == 8:
                     raw_pred = raw_output[0]
                     prediction_class = int(np.argmax(raw_pred))
+                    confidence = float(np.max(raw_pred))
                     is_abnormal = 1 if (prediction_class % 2 != 0) else 0
                     devices_list = ["Fan", "Pump", "Slider", "Valve"]
                     detected_device = devices_list[prediction_class // 2]
@@ -195,18 +256,23 @@ def run_inference_sync(chunk: bytearray, sr: int):
                     result["status"] = "success"
                     result["prediction"] = is_abnormal
                     result["device"] = detected_device
+                    result["confidence"] = confidence
                 else:
                     raw_pred = raw_output[0][0]
                     prediction = 1 if raw_pred >= 0.5 else 0
+                    confidence = float(raw_pred if prediction == 1 else 1.0 - raw_pred)
                     result["status"] = "success"
                     result["prediction"] = prediction
                     result["device"] = "Unknown"
+                    result["confidence"] = confidence
         elif ai_model_type == 'h5' and ai_model is not None:
-            # Run Keras H5 Inference
-            import tensorflow as tf
-            mel_features = extract_mel_spectrogram(saved_wav_path)
+            audio_data = np.frombuffer(chunk, dtype=np.int16)
+            audio_float = audio_data.astype(np.float32) / 32768.0
+            y_16k = librosa.resample(y=audio_float, orig_sr=sr, target_sr=16000)
+            target_sr = 16000
+            
+            mel_features = extract_mel_spectrogram(y_16k, target_sr)
             if mel_features is not None:
-                # Shape: (1, 128, 128, 1)
                 input_data = mel_features.reshape(1, 128, 128, 1).astype(np.float32)
                 raw_output = ai_model.predict(input_data, verbose=0)
                 
@@ -214,6 +280,7 @@ def run_inference_sync(chunk: bytearray, sr: int):
                 if num_classes == 8:
                     raw_pred = raw_output[0]
                     prediction_class = int(np.argmax(raw_pred))
+                    confidence = float(np.max(raw_pred))
                     is_abnormal = 1 if (prediction_class % 2 != 0) else 0
                     devices_list = ["Fan", "Pump", "Slider", "Valve"]
                     detected_device = devices_list[prediction_class // 2]
@@ -221,96 +288,147 @@ def run_inference_sync(chunk: bytearray, sr: int):
                     result["status"] = "success"
                     result["prediction"] = is_abnormal
                     result["device"] = detected_device
+                    result["confidence"] = confidence
                 else:
                     raw_pred = raw_output[0][0]
                     prediction = 1 if raw_pred >= 0.5 else 0
+                    confidence = float(raw_pred if prediction == 1 else 1.0 - raw_pred)
                     result["status"] = "success"
                     result["prediction"] = prediction
                     result["device"] = "Unknown"
+                    result["confidence"] = confidence
         elif ai_model_type == 'pkl' and ai_model is not None and ai_scaler is not None:
-            # Run Fallback RF Inference
-            features = extract_features(saved_wav_path)
+            audio_data = np.frombuffer(chunk, dtype=np.int16)
+            audio_float = audio_data.astype(np.float32) / 32768.0
+            y_16k = librosa.resample(y=audio_float, orig_sr=sr, target_sr=16000)
+            target_sr = 16000
+            
+            features = extract_features(y_16k, target_sr)
             if features is not None:
                 features_scaled = ai_scaler.transform([features])
-                prediction = ai_model.predict(features_scaled)[0]
+                probs = ai_model.predict_proba(features_scaled)[0]
+                prediction = int(np.argmax(probs))
+                confidence = float(np.max(probs))
                 result["status"] = "success"
-                result["prediction"] = int(prediction)
+                result["prediction"] = prediction
                 result["device"] = "Unknown"
+                result["confidence"] = confidence
         else:
-            print("No active model loaded for inference.")
+            pass
     except Exception as e:
         print(f"AI inference error: {e}")
-    # We no longer delete the saved_wav_path here, so it is kept permanently.
+        
+    end_time = time.time()
+    result["latency_ms"] = int((end_time - start_time) * 1000)
     return result
 
-async def process_audio_chunk(chunk: bytearray, websocket: WebSocket, sr: int):
-    global ai_status_message
+async def process_audio_chunk_async(chunk: bytearray, sr: int):
+    global ai_status_message, is_recording, inference_running
+    global recent_predictions, recent_devices, current_smoothed_state, current_raw_state
+    global current_confidence, last_inference_latency_ms
+    
     try:
-        await websocket.send_text("STATE_PROCESSING")
-        ai_status_message = "Analyzing..."
-        
         result = await asyncio.to_thread(run_inference_sync, chunk, sr)
         
         if result["status"] == "success":
             prediction = result["prediction"]
             device = result.get("device", "Unknown")
-            device_prefix = f"[{device}] " if device != "Unknown" else ""
+            confidence = result.get("confidence", 0.0)
+            latency = result.get("latency_ms", 0)
             
-            if prediction == 1:
+            current_raw_state = prediction
+            current_confidence = confidence
+            last_inference_latency_ms = latency
+            
+            recent_predictions.append(prediction)
+            if device != "Unknown":
+                recent_devices.append(device)
+            
+            smoothed_prediction = 1 if sum(recent_predictions) >= 3 else 0
+            current_smoothed_state = smoothed_prediction
+            
+            smoothed_device = device
+            if recent_devices:
+                smoothed_device = collections.Counter(recent_devices).most_common(1)[0][0]
+
+            device_prefix = f"[{smoothed_device}] " if smoothed_device != "Unknown" else ""
+            
+            raw_str = "Abnormal" if current_raw_state == 1 else "Normal"
+            smooth_str = "Abnormal" if current_smoothed_state == 1 else "Normal"
+            print(f"[INFERENCE] Window: {len(chunk)}B | Raw: {raw_str} ({confidence:.2f}) | Smoothed: {smooth_str} | Latency: {latency}ms | Total Rx: {total_received_seconds:.1f}s")
+            
+            if smoothed_prediction == 1:
                 ai_status_message = f"<b>🤖 AI:</b> {device_prefix}<span style='color:red'>⚠️ Anomaly Detected!</span>"
-                await websocket.send_text("STATE_ABNORMAL")
-                print(f"⚠️ {device_prefix}Anomaly Detected!")
+                if connected_esp32:
+                    try:
+                        await connected_esp32.send_text("STATE_ABNORMAL")
+                    except Exception as e:
+                        print(f"Error sending STATE_ABNORMAL: {e}")
             else:
                 ai_status_message = f"<b>🤖 AI:</b> {device_prefix}<span style='color:green'>✅ Sound is normal.</span>"
-                await websocket.send_text("STATE_NORMAL")
-                print(f"✅ {device_prefix}Sound is normal.")
+                if connected_esp32:
+                    try:
+                        await connected_esp32.send_text("STATE_NORMAL")
+                    except Exception as e:
+                        print(f"Error sending STATE_NORMAL: {e}")
     except Exception as e:
         print(f"Error in process_audio_chunk: {e}")
+    finally:
+        inference_running = False
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
-    global connected_esp32, connected_device_name, is_recording, audio_buffer, ai_status_message
+    global connected_esp32, connected_device_name, is_recording
+    global rolling_buffer, bytes_since_last_inference, inference_running
+    global total_received_seconds, ai_status_message
+    
     device_param = websocket.query_params.get("device", "ESP32")
     connected_device_name = device_param
     await websocket.accept()
     connected_esp32 = websocket
-    print(f"Device Connected: {connected_device_name}!")
+    print(f"[WS] Device Connected: {connected_device_name}!")
+    
+    bytes_received_total = 0
+    chunks_count = 0
+    
     try:
         while True:
             data = await websocket.receive()
             if "bytes" in data:
-                # Received audio chunk
+                incoming_len = len(data["bytes"])
+                bytes_received_total += incoming_len
+                
                 if is_recording:
-                    audio_buffer.extend(data["bytes"])
-                    # Process every 3 seconds (24000 bytes at 8000Hz)
-                    if len(audio_buffer) >= 24000:
-                        chunk = audio_buffer[:24000]
-                        # Preserve leftover bytes to avoid audio data loss
-                        audio_buffer = bytearray(audio_buffer[24000:])
-                        
-                        # Process in background task to avoid blocking the websocket loop
-                        asyncio.create_task(process_audio_chunk(chunk, websocket, sample_rate))
- 
+                    total_received_seconds += incoming_len / (SAMPLE_RATE * BYTES_PER_SAMPLE)
+                    rolling_buffer.extend(data["bytes"])
+                    bytes_since_last_inference += incoming_len
+                    
+                    if len(rolling_buffer) > WINDOW_BYTES:
+                        rolling_buffer = rolling_buffer[-WINDOW_BYTES:]
+                    
+                    if len(rolling_buffer) < WINDOW_BYTES:
+                        ai_status_message = "Collecting 10s audio window..."
+                        chunks_count += 1
+                        if chunks_count % 50 == 0:
+                            print(f"[WS] Buffering: {len(rolling_buffer)}/{WINDOW_BYTES} bytes...")
+                    else:
+                        if bytes_since_last_inference >= HOP_BYTES:
+                            if inference_running:
+                                bytes_since_last_inference = 0
+                            else:
+                                chunk_to_process = bytearray(rolling_buffer)
+                                bytes_since_last_inference = 0
+                                inference_running = True
+                                asyncio.create_task(process_audio_chunk_async(chunk_to_process, SAMPLE_RATE))
+                else:
+                    if chunks_count % 100 == 0:
+                        print(f"[WS] Receiving data but NOT recording. Got {incoming_len} bytes")
+                    chunks_count += 1
             elif "text" in data:
-                print(f"Message from {connected_device_name}: {data['text']}")
+                print(f"[WS] Text from {connected_device_name}: {data['text']}")
     except WebSocketDisconnect:
-        print(f"Device Disconnected: {connected_device_name}")
+        print(f"[WS] Device Disconnected: {connected_device_name} (received {bytes_received_total} total bytes)")
         connected_esp32 = None
-
-@app.post("/api/pump/{action}")
-async def control_pump(action: str):
-    global connected_esp32
-    if connected_esp32 is None:
-        return {"status": "error", "message": "Device is not connected"}
-    
-    if action in ["on", "off"]:
-        command = f"PUMP_{action.upper()}"
-        try:
-            await connected_esp32.send_text(command)
-            return {"status": "success", "message": f"Pump turned {'on' if action == 'on' else 'off'}"}
-        except Exception as e:
-            return {"status": "error", "message": f"Transmission error: {e}"}
-    return {"status": "error", "message": "Invalid action"}
 
 @app.get("/api/info")
 async def get_info():
@@ -325,16 +443,37 @@ async def get_info():
 @app.get("/api/status")
 async def get_status():
     global ai_status_message, is_recording
-    if is_recording:
-        return {"status": "success", "message": ai_status_message}
-    return {"status": "success", "message": ""}
+    global rolling_buffer, current_raw_state, current_smoothed_state
+    global current_confidence, last_inference_latency_ms, total_received_seconds
+    
+    buffer_seconds = len(rolling_buffer) / (SAMPLE_RATE * BYTES_PER_SAMPLE)
+    
+    return {
+        "status": "success", 
+        "message": ai_status_message if is_recording else "",
+        "is_recording": is_recording,
+        "buffer_seconds": buffer_seconds,
+        "raw_state": current_raw_state,
+        "smoothed_state": current_smoothed_state,
+        "confidence": current_confidence,
+        "latency_ms": last_inference_latency_ms,
+        "total_received_seconds": total_received_seconds
+    }
 
 @app.post("/api/record/{action}")
 async def control_recording(action: str):
-    global is_recording, audio_buffer, connected_esp32, ai_status_message
+    global is_recording, rolling_buffer, connected_esp32, ai_status_message
+    global bytes_since_last_inference, inference_running, recent_predictions, recent_devices
+    global total_received_seconds
+    
     if action == "start":
         is_recording = True
-        audio_buffer = bytearray()
+        rolling_buffer = bytearray()
+        bytes_since_last_inference = 0
+        inference_running = False
+        recent_predictions.clear()
+        recent_devices.clear()
+        total_received_seconds = 0.0
         ai_status_message = "Recording and awaiting analysis..."
         if connected_esp32:
             try:
@@ -345,7 +484,6 @@ async def control_recording(action: str):
     elif action == "stop":
         is_recording = False
         ai_status_message = "Recording stopped."
-        audio_buffer = bytearray()
         if connected_esp32:
             try:
                 await connected_esp32.send_text("STOP_RECORDING")
@@ -357,108 +495,44 @@ async def control_recording(action: str):
 
 @app.post("/api/predict-audio")
 async def predict_audio(file: UploadFile = File(...)):
-    global ai_model_type, onnx_session, ai_model, ai_scaler
-    
-    temp_dir = tempfile.gettempdir()
-    temp_file_path = os.path.join(temp_dir, f"upload_{datetime.now().timestamp()}_{file.filename}")
-    
-    with open(temp_file_path, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
-        
-    result = {"status": "error", "prediction": None, "device": "Unknown", "message": "No prediction made"}
-    wav_path = temp_file_path + ".wav"
-    
     try:
-        audio = AudioSegment.from_file(temp_file_path)
-        audio.export(wav_path, format="wav")
-        
-        if ai_model_type == 'onnx' and onnx_session is not None:
-            input_name = onnx_session.get_inputs()[0].name
-            input_shape = onnx_session.get_inputs()[0].shape
+        # Save the uploaded file temporarily
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
+            content = await file.read()
+            tmp.write(content)
+            tmp_path = tmp.name
+
+        # Load with librosa at target sample rate 16000
+        y, sr = librosa.load(tmp_path, sr=16000)
+        os.remove(tmp_path)
+
+        # Convert to int16 bytes to feed into run_inference_sync
+        audio_int16 = (y * 32767).astype(np.int16)
+        chunk = audio_int16.tobytes()
+
+        # Run the existing inference pipeline
+        result = await asyncio.to_thread(run_inference_sync, chunk, 16000)
+
+        if result["status"] == "success":
+            pred = result["prediction"]
+            device = result.get("device", "Unknown")
+            conf = result.get("confidence", 0.0)
             
-            raw_output = None
-            if len(input_shape) >= 3 and input_shape[1] == 40:
-                features = extract_mfcc_40(wav_path)
-                if features is not None:
-                    input_data = features.reshape(1, 40, 1).astype(np.float32)
-                    raw_output = onnx_session.run(None, {input_name: input_data})[0]
-            else:
-                mel_features = extract_mel_spectrogram(wav_path)
-                if mel_features is not None:
-                    input_data = mel_features.reshape(1, 128, 128, 1).astype(np.float32)
-                    raw_output = onnx_session.run(None, {input_name: input_data})[0]
+            state_str = "Abnormal" if pred == 1 else "Normal"
+            device_prefix = f"[{device}] " if device != "Unknown" else ""
+            msg = f"{device_prefix}{state_str} (Conf: {conf*100:.1f}%)"
             
-            if raw_output is not None:
-                num_classes = raw_output.shape[1]
-                if num_classes == 8:
-                    raw_pred = raw_output[0]
-                    prediction_class = int(np.argmax(raw_pred))
-                    is_abnormal = 1 if (prediction_class % 2 != 0) else 0
-                    devices_list = ["Fan", "Pump", "Slider", "Valve"]
-                    detected_device = devices_list[prediction_class // 2]
-                    
-                    result["status"] = "success"
-                    result["prediction"] = is_abnormal
-                    result["device"] = detected_device
-                    result["message"] = f"Detected {detected_device} - Anomaly!" if is_abnormal == 1 else f"Detected {detected_device} - Normal."
-                else:
-                    raw_pred = raw_output[0][0]
-                    prediction = 1 if raw_pred >= 0.5 else 0
-                    result["status"] = "success"
-                    result["prediction"] = prediction
-                    result["device"] = "Unknown"
-                    result["message"] = "Anomaly Detected!" if prediction == 1 else "Sound is normal."
-        elif ai_model_type == 'h5' and ai_model is not None:
-            import tensorflow as tf
-            mel_features = extract_mel_spectrogram(wav_path)
-            if mel_features is not None:
-                input_data = mel_features.reshape(1, 128, 128, 1).astype(np.float32)
-                raw_output = ai_model.predict(input_data, verbose=0)
-                
-                num_classes = raw_output.shape[1]
-                if num_classes == 8:
-                    raw_pred = raw_output[0]
-                    prediction_class = int(np.argmax(raw_pred))
-                    is_abnormal = 1 if (prediction_class % 2 != 0) else 0
-                    devices_list = ["Fan", "Pump", "Slider", "Valve"]
-                    detected_device = devices_list[prediction_class // 2]
-                    
-                    result["status"] = "success"
-                    result["prediction"] = is_abnormal
-                    result["device"] = detected_device
-                    result["message"] = f"Detected {detected_device} - Anomaly!" if is_abnormal == 1 else f"Detected {detected_device} - Normal."
-                else:
-                    raw_pred = raw_output[0][0]
-                    prediction = 1 if raw_pred >= 0.5 else 0
-                    result["status"] = "success"
-                    result["prediction"] = prediction
-                    result["device"] = "Unknown"
-                    result["message"] = "Anomaly Detected!" if prediction == 1 else "Sound is normal."
-        elif ai_model_type == 'pkl' and ai_model is not None and ai_scaler is not None:
-            features = extract_features(wav_path)
-            if features is not None:
-                features_scaled = ai_scaler.transform([features])
-                prediction = ai_model.predict(features_scaled)[0]
-                result["status"] = "success"
-                result["prediction"] = int(prediction)
-                result["device"] = "Unknown"
-                result["message"] = "Anomaly Detected!" if prediction == 1 else "Sound is normal."
+            return {
+                "status": "success",
+                "prediction": pred,
+                "message": msg
+            }
         else:
-            result["message"] = "No active AI model loaded on server."
-            
+            return {"status": "error", "prediction": -1, "message": "Inference failed."}
+
     except Exception as e:
-        result["message"] = f"Inference failed: {str(e)}"
-        print(f"Error predicting uploaded audio: {e}")
-        traceback.print_exc()
-    finally:
-        for p in [temp_file_path, wav_path]:
-            try:
-                if os.path.exists(p):
-                    os.remove(p)
-            except Exception as e:
-                print(f"Error deleting temp file {p}: {e}")
-                
-    return result
+        print(f"Error in predict-audio: {e}")
+        return {"status": "error", "prediction": -1, "message": str(e)}
 
 if __name__ == "__main__":
     import socket
@@ -476,7 +550,6 @@ if __name__ == "__main__":
             
     local_ip = get_local_ip()
     
-    # Setup mDNS
     zeroconf = Zeroconf()
     info = ServiceInfo(
         "_ws._tcp.local.",

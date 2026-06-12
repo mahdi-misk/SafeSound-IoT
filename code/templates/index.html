@@ -3,34 +3,49 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>AI Motor Monitoring</title>
+    <title>AI Motor Monitoring - Live</title>
     <style>
         body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: #121212; color: #ffffff; text-align: center; padding: 50px; }
-        .card { background: #1e1e1e; padding: 20px; border-radius: 10px; display: inline-block; box-shadow: 0 4px 8px rgba(0,0,0,0.5); }
+        .card { background: #1e1e1e; padding: 20px; border-radius: 10px; display: inline-block; box-shadow: 0 4px 8px rgba(0,0,0,0.5); min-width: 400px;}
         .btn { padding: 10px 20px; margin: 10px; border: none; border-radius: 5px; cursor: pointer; font-size: 16px; color: white; }
         .btn-start { background-color: #28a745; }
         .btn-stop { background-color: #dc3545; }
         .btn-pump { background-color: #007bff; }
         #status-box { margin-top: 20px; padding: 15px; border-radius: 5px; background: #333; min-height: 50px; font-size: 18px; }
+        .metrics { text-align: left; margin-top: 20px; background: #2a2a2a; padding: 15px; border-radius: 8px; font-size: 14px; }
+        .metrics span { font-weight: bold; }
+        .progress-container { width: 100%; background-color: #333; border-radius: 5px; margin-top: 10px;}
+        .progress-bar { width: 0%; height: 10px; background-color: #007bff; border-radius: 5px; transition: width 0.5s; }
     </style>
 </head>
 <body>
     <div class="card">
         <h1>🎙️ Smart Motor Monitor</h1>
-        <p>ESP32 WebSocket Audio Analyzer</p>
+        <p>10s Sliding Window Live Analyzer</p>
         
         <div style="margin: 15px 0; padding: 10px; background: #2a2a2a; border-radius: 8px; font-size: 16px;">
-            ESP32 Connection: <span id="esp-status" style="font-weight: bold; color: #dc3545;">Disconnected ❌</span>
+            Connection: <span id="esp-status" style="font-weight: bold; color: #dc3545;">Disconnected ❌</span>
         </div>
         
         <div>
-            <button class="btn btn-start" onclick="controlRecording('start')">Start Recording</button>
-            <button class="btn btn-stop" onclick="controlRecording('stop')">Stop Recording</button>
+            <button class="btn btn-start" onclick="controlRecording('start')">Start</button>
+            <button class="btn btn-stop" onclick="controlRecording('stop')">Stop</button>
         </div>
         
-        <div>
-            <button class="btn btn-pump" onclick="controlPump('on')">Turn Pump ON</button>
-            <button class="btn btn-pump" onclick="controlPump('off')">Turn Pump OFF</button>
+        <div id="status-box">Waiting for analysis...</div>
+
+        <div class="metrics">
+            <div>Buffer Progress (10s req):</div>
+            <div class="progress-container">
+                <div class="progress-bar" id="buffer-progress"></div>
+            </div>
+            <div style="margin-top: 10px;">
+                Raw Prediction: <span id="m-raw">--</span><br>
+                Smoothed State: <span id="m-smooth">--</span><br>
+                Confidence: <span id="m-conf">--</span>%<br>
+                Inference Latency: <span id="m-latency">--</span> ms<br>
+                Total Rx Audio: <span id="m-total-rx">--</span> s
+            </div>
         </div>
 
         <div style="margin-top: 20px; padding: 15px; border-top: 1px solid #444;">
@@ -38,18 +53,13 @@
             <input type="file" id="audioUpload" accept=".wav,.mp3" style="margin-bottom: 10px;">
             <br>
             <button class="btn btn-pump" onclick="uploadAudio()">Analyze Uploaded File</button>
+            <div id="upload-result" style="margin-top: 15px; font-size: 18px; min-height: 30px;"></div>
         </div>
-
-        <div id="status-box">Waiting for analysis...</div>
     </div>
 
     <script>
         async function controlRecording(action) {
             await fetch(`/api/record/${action}`, { method: 'POST' });
-        }
-        
-        async function controlPump(action) {
-            await fetch(`/api/pump/${action}`, { method: 'POST' });
         }
 
         async function uploadAudio() {
@@ -59,7 +69,7 @@
                 return;
             }
             
-            document.getElementById('status-box').innerHTML = "Uploading and analyzing...";
+            document.getElementById('upload-result').innerHTML = "Uploading and analyzing...";
             
             const formData = new FormData();
             formData.append("file", fileInput.files[0]);
@@ -75,22 +85,14 @@
                 if (data.prediction === 1) color = "red";
                 else if (data.prediction === 0) color = "green";
                 
-                document.getElementById('status-box').innerHTML = `<b>Upload Analysis:</b> <span style="color:${color}">${data.message}</span>`;
+                document.getElementById('upload-result').innerHTML = `<b>Upload Analysis:</b> <span style="color:${color}">${data.message}</span>`;
             } catch (e) {
-                document.getElementById('status-box').innerHTML = "Error analyzing uploaded file.";
+                document.getElementById('upload-result').innerHTML = "Error analyzing uploaded file.";
             }
         }
 
         setInterval(async () => {
             try {
-                // Update AI status
-                let res = await fetch('/api/status');
-                let data = await res.json();
-                if (data.message) {
-                    document.getElementById('status-box').innerHTML = data.message;
-                }
-                
-                // Update ESP32 connection status
                 let resInfo = await fetch('/api/info');
                 let dataInfo = await resInfo.json();
                 const espStatusEl = document.getElementById('esp-status');
@@ -102,6 +104,39 @@
                     espStatusEl.innerHTML = "Disconnected ❌";
                     espStatusEl.style.color = "#dc3545";
                 }
+
+                let res = await fetch('/api/status');
+                let data = await res.json();
+                
+                if (data.is_recording) {
+                    if (data.message) {
+                        document.getElementById('status-box').innerHTML = data.message;
+                    }
+                    
+                    let bufSec = parseFloat(data.buffer_seconds) || 0;
+                    let progress = Math.min(100, (bufSec / 10.0) * 100);
+                    document.getElementById('buffer-progress').style.width = progress + '%';
+                    
+                    if (bufSec >= 10.0) {
+                        document.getElementById('buffer-progress').style.backgroundColor = '#28a745';
+                    } else {
+                        document.getElementById('buffer-progress').style.backgroundColor = '#007bff';
+                    }
+                    
+                    document.getElementById('m-raw').innerText = data.raw_state === 1 ? "Abnormal" : "Normal";
+                    document.getElementById('m-raw').style.color = data.raw_state === 1 ? "#dc3545" : "#28a745";
+                    
+                    document.getElementById('m-smooth').innerText = data.smoothed_state === 1 ? "Abnormal" : "Normal";
+                    document.getElementById('m-smooth').style.color = data.smoothed_state === 1 ? "#dc3545" : "#28a745";
+                    
+                    document.getElementById('m-conf').innerText = ((parseFloat(data.confidence) || 0) * 100).toFixed(1);
+                    document.getElementById('m-latency').innerText = data.latency_ms;
+                    document.getElementById('m-total-rx').innerText = parseFloat(data.total_received_seconds).toFixed(1);
+                } else {
+                    document.getElementById('status-box').innerHTML = data.message || "Waiting to start...";
+                    document.getElementById('buffer-progress').style.width = '0%';
+                }
+                
             } catch (e) {}
         }, 1000);
     </script>
