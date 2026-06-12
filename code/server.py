@@ -539,14 +539,18 @@ if __name__ == "__main__":
     from zeroconf import ServiceInfo, Zeroconf
     
     def get_local_ip():
-        try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            s.connect(("8.8.8.8", 80))
-            ip = s.getsockname()[0]
-            s.close()
-            return ip
-        except Exception:
-            return "127.0.0.1"
+        # Try ESP32 AP gateway first (for AP mode), then internet
+        for target in ["192.168.4.1", "8.8.8.8"]:
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                s.settimeout(1)
+                s.connect((target, 80))
+                ip = s.getsockname()[0]
+                s.close()
+                return ip
+            except Exception:
+                pass
+        return "192.168.4.2"
             
     local_ip = get_local_ip()
     
